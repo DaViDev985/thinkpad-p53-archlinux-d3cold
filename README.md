@@ -8,13 +8,16 @@
 
 On hybrid graphics laptops, the dedicated NVIDIA GPU (dGPU) should power down to **`D3cold` (0 Watts)** when idle on battery, leaving the energy-efficient Intel iGPU to drive the desktop.
 
-Out of the box on Linux, several independent bugs prevent the dGPU from sleeping:
-1. **KDE Plasma & KWin bind to NVIDIA:** KWin and Electron/Wayland apps scan GLVND and initialize contexts on NVIDIA, preventing autosuspend.
-2. **KWin Colon Parsing Crash:** Setting `KWIN_DRM_DEVICES` to standard by-path symlinks (like `/dev/dri/by-path/pci-0000:00:02.0-card`) crashes KWin to a blinking cursor because KWin splits on colons `:`.
-3. **NVIDIA Driver 580 GSP Firmware Bug:** Driver 580+ defaults to GSP firmware on Turing cards, which breaks Runtime D3 (RTD3).
-4. **HDMI Audio PCIe Power Dependency:** The NVIDIA companion HDMI audio controller (`0000:01:00.1`) shares the GPU's PCIe power domain. If ALSA powersave is off, audio stays in `D0`, physically locking the GPU in `D0`.
-5. **TLP Config Precedence:** `/etc/tlp.conf` takes priority over drop-ins in `/etc/tlp.d/`. Setting audio powersave in a drop-in file is silently overridden by `/etc/tlp.conf`.
-6. **KDE `ksystemstats` GPU Polling Loop:** Plasma 6's GPU monitoring plugin launches `nvidia-smi dmon -d 2` in the background, waking the card every 2 seconds.
+At the same time, external displays (HDMI and Mini-DisplayPort/Type-C) on the ThinkPad P53 are **physically wired directly to the NVIDIA Quadro dGPU**, while the internal laptop panel is wired to the **Intel iGPU**.
+
+Out of the box on Linux, several independent bugs prevent this setup from working properly:
+1. **External Display Routing & KWin Wayland:** By default, if KWin only binds to the Intel GPU (`card1`), external ports wired to NVIDIA remain unprobed, resulting in a black screen and no detected monitors in KDE Display Settings. Passing both cards (`card1:card0`) configures Intel as primary (saving power) and NVIDIA as secondary (driving external monitors).
+2. **Xwayland Secondary Device Locking:** When an external monitor is plugged in, Xwayland opens `/dev/dri/card0`. When unplugged, Xwayland leaks the file descriptor and never closes the device, preventing the GPU from returning to `D3cold`. Setting `XWAYLAND_NO_GLAMOR=1` stops Xwayland from ever touching DRM hardware devices while leaving native Wayland desktop compositing and external display driving to KWin.
+3. **KWin Colon Parsing Crash:** Setting `KWIN_DRM_DEVICES` to standard by-path symlinks (like `/dev/dri/by-path/pci-0000:00:02.0-card`) crashes KWin to a blinking cursor because KWin splits on colons `:`. Resolving with `readlink -f` avoids this.
+4. **NVIDIA Driver 580 GSP Firmware Bug:** Driver 580+ defaults to GSP firmware on Turing cards, which breaks Runtime D3 (RTD3).
+5. **HDMI Audio PCIe Power Dependency:** The NVIDIA companion HDMI audio controller (`0000:01:00.1`) shares the GPU's PCIe power domain. If ALSA powersave is off, audio stays in `D0`, physically locking the GPU in `D0`.
+6. **TLP Config Precedence:** `/etc/tlp.conf` takes priority over drop-ins in `/etc/tlp.d/`. Setting audio powersave in a drop-in file is silently overridden by `/etc/tlp.conf` if not commented out.
+7. **KDE `ksystemstats` GPU Polling Loop:** Plasma 6's GPU monitoring plugin launches `nvidia-smi dmon -d 2` in the background, waking the card every 2 seconds.
 
 This repository provides an automated script and manual documentation to fix all these issues while **preserving 100% plug-and-play compatibility if you temporarily switch the BIOS to "Discrete Graphics"**.
 
@@ -31,7 +34,7 @@ sudo ./setup.sh
 
 Then **reboot your laptop**.
 
-After rebooting, check that the card is sleeping in `D3cold`:
+After rebooting, check that the card is sleeping in `D3cold` (when unplugged from external monitors):
 
 ```bash
 ./check-status.sh
@@ -91,19 +94,28 @@ sudo mkinitcpio -P
 
 ---
 
-### 4. Dynamic KWin & Mesa Environment Generator (BIOS-Safe)
+### 4. Dynamic KWin Multi-GPU Environment Generator (BIOS-Safe)
 Create `/etc/systemd/user-environment-generators/10-kwin-intel.sh`:
 ```sh
 #!/bin/sh
-# Dynamically resolves the Intel iGPU symlink to its real device node (e.g. /dev/dri/card1)
+# Dynamically resolves the Intel iGPU and NVIDIA dGPU symlinks to real device nodes.
 # Avoiding colons in path which break KWin's DRM device parser.
 INTEL_CARD=$(readlink -f /dev/dri/by-path/pci-0000:00:02.0-card 2>/dev/null)
+NVIDIA_CARD=$(readlink -f /dev/dri/by-path/pci-0000:01:00.0-card 2>/dev/null)
 
 if [ -n "$INTEL_CARD" ] && [ -e "$INTEL_CARD" ]; then
-    echo "KWIN_DRM_DEVICES=$INTEL_CARD"
+    if [ -n "$NVIDIA_CARD" ] && [ -e "$NVIDIA_CARD" ]; then
+        # Intel as Primary (desktop/laptop screen), NVIDIA as Secondary (external HDMI/DP ports)
+        echo "KWIN_DRM_DEVICES=$INTEL_CARD:$NVIDIA_CARD"
+    else
+        echo "KWIN_DRM_DEVICES=$INTEL_CARD"
+    fi
+    # Restrict desktop EGL to Mesa so background apps don't lock NVIDIA
     echo "__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json"
+    # Prevent Xwayland from locking secondary DRM nodes across hotplugs
+    echo "XWAYLAND_NO_GLAMOR=1"
 fi
-# If Intel is absent (BIOS Discrete Mode), outputs nothing so Plasma boots on NVIDIA.
+# If Intel is absent (BIOS Discrete Mode), outputs nothing so Plasma boots natively on NVIDIA.
 ```
 Make it executable:
 ```bash
@@ -111,9 +123,12 @@ sudo chmod +x /etc/systemd/user-environment-generators/10-kwin-intel.sh
 ```
 
 **Why this works:**
-- Uses `readlink -f` to resolve to `/dev/dri/cardX`, preventing KWin's colon-split crash.
-- Directs KWin and Electron/Mesa apps away from the NVIDIA GLVND loader.
-- If you reboot into the BIOS and switch to **Discrete Graphics**, the Intel card is absent, so the script outputs nothing and Plasma cleanly boots natively on NVIDIA.
+- Uses `readlink -f` to resolve device paths, preventing KWin's colon-split crash.
+- Declares Intel as the **Primary GPU** (compositing desktop and internal screen at low power).
+- Declares NVIDIA as the **Secondary GPU** (allowing KWin to discover and drive external monitors connected to HDMI / Mini-DP).
+- Exports `__EGL_VENDOR_LIBRARY_FILENAMES` and `XWAYLAND_NO_GLAMOR=1` so background desktop helpers and Xwayland never touch or hold handles on the secondary DRM device (`card0`).
+- When the external monitor is unplugged on battery, NVIDIA cleanly enters `D3cold`.
+- If you reboot into the BIOS and switch to **Discrete Graphics**, the Intel card is absent on the PCIe bus, so the script outputs nothing and Plasma cleanly boots natively on NVIDIA.
 
 ---
 
@@ -146,23 +161,15 @@ Exec = /usr/bin/mv -f /usr/lib/qt6/plugins/ksystemstats/ksystemstats_plugin_gpu.
 
 > **Warning:** Do NOT run `nvidia-smi` repeatedly to check if the GPU is sleeping! Running `nvidia-smi` communicates with the GPU and immediately wakes it up from D3cold, resetting the idle timer.
 
-Instead, inspect the Linux sysfs interface directly:
+Instead, run the included safe checker:
 
-```bash
-# Check GPU PCI Runtime Status
-cat /sys/bus/pci/devices/0000:01:00.0/power/runtime_status
-# Expected: suspended
-
-# Check GPU Power State
-cat /sys/bus/pci/devices/0000:01:00.0/power_state
-# Expected: D3cold
-
-# Check Audio Controller Status
-cat /sys/bus/pci/devices/0000:01:00.1/power/runtime_status
-# Expected: suspended
-```
-
-Or simply run the included script:
 ```bash
 ./check-status.sh
+```
+
+When an external monitor is plugged into HDMI, the NVIDIA card is expected to be `active (D0)` to drive the display.  
+When the external monitor is unplugged and idle on battery, it will report:
+```text
+GPU PCI (0000:01:00.0):     Status: suspended  State: D3cold
+Audio PCI (0000:01:00.1):   Status: suspended  State: D3cold
 ```

@@ -4,7 +4,8 @@
 # ==============================================================================
 # This script configures Linux / KDE Plasma 6 (Wayland) to keep the NVIDIA
 # Quadro T1000 GPU and its companion HDMI audio controller powered down in
-# D3cold (0 Watts) when idle on battery, while retaining 100% plug-and-play
+# D3cold (0 Watts) when idle on battery, while driving external monitors
+# (HDMI / DisplayPort) when connected and retaining 100% plug-and-play
 # compatibility if the BIOS is switched to "Discrete Graphics".
 # ==============================================================================
 
@@ -65,21 +66,30 @@ if [[ -f /etc/udev/rules.d/90-nvidia-audio-wakeup.rules ]]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 4. Dynamic KWin & Mesa Environment Generator (BIOS-Safe)
+# 4. Dynamic KWin Multi-GPU Environment Generator (BIOS-Safe)
 # ------------------------------------------------------------------------------
-echo "[4/7] Installing dynamic KWin & Mesa user-session generator..."
+echo "[4/7] Installing dynamic KWin multi-GPU user-session generator..."
 mkdir -p /etc/systemd/user-environment-generators
 cat << 'EOF' > /etc/systemd/user-environment-generators/10-kwin-intel.sh
 #!/bin/sh
-# Dynamically resolves the Intel iGPU symlink to its real device node (e.g. /dev/dri/card1)
-# Avoiding colons in path which break KWin DRM device parser.
+# Dynamically resolves the Intel iGPU and NVIDIA dGPU symlinks to real device nodes.
+# Avoiding colons in path which break KWin's DRM device parser.
 INTEL_CARD=$(readlink -f /dev/dri/by-path/pci-0000:00:02.0-card 2>/dev/null)
+NVIDIA_CARD=$(readlink -f /dev/dri/by-path/pci-0000:01:00.0-card 2>/dev/null)
 
 if [ -n "$INTEL_CARD" ] && [ -e "$INTEL_CARD" ]; then
-    echo "KWIN_DRM_DEVICES=$INTEL_CARD"
+    if [ -n "$NVIDIA_CARD" ] && [ -e "$NVIDIA_CARD" ]; then
+        # Intel as Primary (desktop/laptop screen), NVIDIA as Secondary (external HDMI/DP ports)
+        echo "KWIN_DRM_DEVICES=$INTEL_CARD:$NVIDIA_CARD"
+    else
+        echo "KWIN_DRM_DEVICES=$INTEL_CARD"
+    fi
+    # Restrict desktop EGL to Mesa so background apps don't lock NVIDIA
     echo "__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json"
+    # Prevent Xwayland from locking secondary DRM nodes across hotplugs
+    echo "XWAYLAND_NO_GLAMOR=1"
 fi
-# If Intel is absent (BIOS Discrete Mode), outputs nothing so Plasma boots on NVIDIA.
+# If Intel is absent (BIOS Discrete Mode), outputs nothing so Plasma boots natively on NVIDIA.
 EOF
 chmod +x /etc/systemd/user-environment-generators/10-kwin-intel.sh
 
