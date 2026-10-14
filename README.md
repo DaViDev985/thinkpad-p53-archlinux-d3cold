@@ -21,6 +21,8 @@ Out of the box on Linux, several independent bugs prevent this setup from workin
 
 This repository provides an automated script and manual documentation to fix all these issues while **preserving 100% plug-and-play compatibility if you temporarily switch the BIOS to "Discrete Graphics"**.
 
+⚠️**Known issue:** If the laptop is connected to an external monitor and then you disconnect it, the GPU won't be able to enter D3cold until you reboot the laptop. I (and antigravity) have yet to find a solution that doesn't break other stuff, but the issue is caused by an Xwayland process keeping the GPU awake.  
+
 ---
 
 ## Quick Start (Automated)
@@ -173,3 +175,7 @@ When the external monitor is unplugged and idle on battery, it will report:
 GPU PCI (0000:01:00.0):     Status: suspended  State: D3cold
 Audio PCI (0000:01:00.1):   Status: suspended  State: D3cold
 ```
+
+---
+
+**Disclaimer:** This solution was made with the use of AI (antigravity-cli:Gemini-3.8-Flash). If you find some ugly stuff in the code, or have some suggestions/improvements, feel free to submit a pull request or open an issue.
